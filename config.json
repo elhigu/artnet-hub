@@ -1,13 +1,13 @@
 {
   "listen": {
     "address": "0.0.0.0",
-    "port": 6524
+    "port": 6454
   },
   "mappings": [
     {
-      "address": "192.168.0.11",
+      "host": { "address": "192.168.0.11", "port": 6454 },
       "//": "Mapping which universes will be realayed here and what how they are mapped",
-      "universes": [{ "in": [16, 31], "out": [0, 15] }]
+      "universes": [{ "input": [16, 31], "output": [0, 15] }]
     }
   ]
 }
