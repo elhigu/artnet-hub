@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::{fs::File, str::FromStr};
+use std::{fs::File, net::SocketAddr};
+
+use artnet_protocol::*;
+use std::net::{ToSocketAddrs, UdpSocket};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AddressConfig {
@@ -35,10 +38,12 @@ fn read_config_file(file_path: &str) -> std::result::Result<Config, std::io::Err
     Ok(config)
 }
 
-// TODO: create Device mapping output threads
-
-use artnet_protocol::*;
-use std::net::{ToSocketAddrs, UdpSocket};
+// create Device mapping output threads
+struct OutputDevice {
+    config: DeviceMappingConfig,
+    incoming_universes: Vec<u8>,
+    output_address: SocketAddr,
+}
 
 fn main() {
     let config = read_config_file("config.json").unwrap();
@@ -61,6 +66,9 @@ fn main() {
             let mut buffer = [0u8; 1024];
             let (length, addr) = socket.recv_from(&mut buffer).unwrap();
             let command = ArtCommand::from_buffer(&buffer[..length]).unwrap();
+
+            // TODO: record and analyze incoming packets and try to recognize if packages are dropped
+            //       or arriving in very wrong order etc.
 
             println!("Received {:?}", command);
 
