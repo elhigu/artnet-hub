@@ -5,6 +5,9 @@ use std::{fs::File, net::SocketAddr};
 use artnet_protocol::*;
 use std::net::{ToSocketAddrs, UdpSocket};
 
+use std::thread;
+use std::time::Instant;
+
 #[derive(Serialize, Deserialize, Debug)]
 struct AddressConfig {
     address: String,
@@ -40,13 +43,95 @@ fn read_config_file(file_path: &str) -> std::result::Result<Config, std::io::Err
 
 // create Device mapping output threads
 struct OutputDevice {
-    config: DeviceMappingConfig,
     incoming_universes: Vec<u8>,
     output_address: SocketAddr,
 }
 
+impl OutputDevice {
+    fn new(config: &DeviceMappingConfig) -> OutputDevice {
+        OutputDevice {
+            incoming_universes: Vec::new(),
+            output_address: format!("{}:{}", &config.host.address, &config.host.port)
+                .to_socket_addrs()
+                .unwrap()
+                .next()
+                .unwrap(),
+        }
+    }
+}
+
+struct Outputs {
+    devices: Vec<OutputDevice>,
+}
+
+impl Outputs {
+    fn new(config: &Vec<DeviceMappingConfig>) -> Outputs {
+        let mut devices: Vec<OutputDevice> = Vec::new();
+
+        for device_config in config {
+            devices.push(OutputDevice::new(&device_config));
+        }
+
+        Outputs { devices }
+    }
+
+    fn add_universe(packet: Output) {
+        // TODO: figure out to which device this one belongs and put it there
+    }
+}
+
+struct Stats {
+    total_packets: u64,
+    total_bytes: usize,
+    packets_since_last_report: u64,
+    bytes_since_last_report: usize,
+    last_report_time: Instant,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats {
+            total_packets: 0,
+            total_bytes: 0,
+            packets_since_last_report: 0,
+            bytes_since_last_report: 0,
+            last_report_time: Instant::now(),
+        }
+    }
+
+    fn got_packet(&mut self, size: &usize) {
+        self.total_packets += 1;
+        self.total_bytes += size;
+        self.packets_since_last_report += 1;
+        self.bytes_since_last_report += size;
+
+        // report every 5 secs as a side effect :likeaboss:
+        if (self.last_report_time.elapsed().as_secs() > 5) {
+            self.report();
+        }
+    }
+
+    fn report(&mut self) {
+        let elapsed = self.last_report_time.elapsed();
+        println!(
+            "{} universes/s {:.2} Mbps",
+            (&self.packets_since_last_report * 1000000) as u128 / elapsed.as_micros(),
+            (&self.bytes_since_last_report * 1000000) as f64
+                / (elapsed.as_micros() as f64)
+                / 1024.
+                / 1024.
+                * 8.,
+        );
+        self.packets_since_last_report = 0;
+        self.bytes_since_last_report = 0;
+        self.last_report_time = Instant::now();
+    }
+}
+
 fn main() {
     let config = read_config_file("config.json").unwrap();
+    let outputs = Outputs::new(&config.mappings);
+    let mut stats = Stats::new();
 
     {
         let socket =
@@ -67,12 +152,13 @@ fn main() {
             let (length, addr) = socket.recv_from(&mut buffer).unwrap();
             let command = ArtCommand::from_buffer(&buffer[..length]).unwrap();
 
-            // TODO: record and analyze incoming packets and try to recognize if packages are dropped
-            //       or arriving in very wrong order etc.
-
-            println!("Received {:?}", command);
+            stats.got_packet(&length);
 
             match command {
+                ArtCommand::Output(output) => {
+                    // println!("Handling output {:?}", output);
+                }
+
                 // TODO: invent reasonable values to poll reply
                 ArtCommand::Poll(poll) => {
                     // This will most likely be our own poll request, as this is broadcast to all devices on the network
@@ -126,8 +212,10 @@ fn main() {
                     socket.send_to(&bytes, &addr).unwrap();
                 }
 
+                /*
                 ArtCommand::PollReply(reply) => {
-                    /* Currently there is no reason to react to PollReply messages, since we are just getting data in
+                    // Currently there is no reason to react to PollReply messages, since we are just
+                    // getting data in
 
                     // This is an ArtNet node on the network. We can send commands to it like this:
                     let command = ArtCommand::Output(Output {
@@ -136,9 +224,12 @@ fn main() {
                     });
                     let bytes = command.write_to_buffer().unwrap();
                     socket.send_to(&bytes, &addr).unwrap();
-                    */
+
                 }
-                _ => {}
+                */
+                _ => {
+                    println!("Received unhandled {:?}", command);
+                }
             }
         }
     } // the socket is closed here
