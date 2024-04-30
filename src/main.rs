@@ -17,7 +17,7 @@ struct AddressConfig {
 #[derive(Serialize, Deserialize, Debug)]
 struct UniverseMappingConfig {
     input: (u16, u16),
-    output: (u16, u16),
+    output: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -39,53 +39,6 @@ fn read_config_file(file_path: &str) -> std::result::Result<Config, std::io::Err
     let config: Config = serde_json::from_str(&contents)?;
     println!("{:?}", config);
     Ok(config)
-}
-
-// create Device mapping output threads
-struct OutputDevice {
-    incoming_universes: Vec<u8>,
-    output_address: SocketAddr,
-}
-
-impl OutputDevice {
-    fn new(config: &DeviceMappingConfig) -> OutputDevice {
-        OutputDevice {
-            incoming_universes: Vec::new(),
-            output_address: format!("{}:{}", &config.host.address, &config.host.port)
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap(),
-        }
-    }
-}
-
-struct Outputs {
-    devices: Vec<OutputDevice>,
-}
-
-impl Outputs {
-    fn new(config: &Vec<DeviceMappingConfig>) -> Outputs {
-        let mut devices: Vec<OutputDevice> = Vec::new();
-
-        for device_config in config {
-            devices.push(OutputDevice::new(&device_config));
-        }
-
-        Outputs { devices }
-    }
-
-    fn add_universe(packet: Output) {
-        // TODO: figure out to which device this one belongs and put it there
-    }
-}
-
-struct Stats {
-    total_packets: u64,
-    total_bytes: usize,
-    packets_since_last_report: u64,
-    bytes_since_last_report: usize,
-    last_report_time: Instant,
 }
 
 impl Stats {
@@ -128,9 +81,86 @@ impl Stats {
     }
 }
 
+struct OutputDevice {
+    output_address: SocketAddr,
+    output_frame: Vec<u8>, // virtual screen where proxy writes the universes for passing them as a single frame to ESP
+    current_universes: Vec<u32>, // universes, which has arrived during this frame
+    // Helps figuring out if some packet has gone missing. Typically with gigabit network 100kB of data should arrive in less than 1ms.
+    average_micros_to_get_all_universes: f32,
+}
+
+impl OutputDevice {
+    fn new(config: &DeviceMappingConfig) -> OutputDevice {
+        OutputDevice {
+            output_address: format!("{}:{}", &config.host.address, &config.host.port)
+                .to_socket_addrs()
+                .unwrap()
+                .next()
+                .unwrap(),
+            output_frame: Vec::new(), // TODO: figure out here from number of universes how big array is needed
+            current_universes: Vec::new(),
+            average_micros_to_get_all_universes: 0.,
+        }
+    }
+
+    // TODO: maybe we need a little bit better data about universes that vec<u8>...
+    fn add_universe(&mut self) {
+        // TODO: get port address
+
+        // update destination universe
+
+        // add to incoming_universes to correct position (combine data and set RGB oder)
+
+        // if all universes of frame are in, send data to ESP
+        // and record how long it took to get all universes
+
+        // if some universe does not arrive in proper time then frame is sent without it and
+
+        // NOTE: if some universe is coming with unexpectedly long delay or a
+        //       universe does not come at all clear the incoming buffer and
+        //       return failure
+    }
+
+    // TODO: when this is called? Probably when all universes of a frame has been received or
+    //       if too long has passed since the first packet of the frame
+    fn send_frame(&mut self) {}
+}
+
+struct Outputs {
+    devices: Vec<OutputDevice>,
+}
+
+impl Outputs {
+    fn new(config: &Vec<DeviceMappingConfig>) -> Outputs {
+        let mut devices: Vec<OutputDevice> = Vec::new();
+
+        for device_config in config {
+            devices.push(OutputDevice::new(&device_config));
+        }
+
+        Outputs { devices }
+    }
+
+    fn add_universe(&mut self, packet: Output) {
+        // packet.port_address, length, data
+        // TODO: find device for the port_address, pass packet ownership there
+
+        // TODO: figure out to which device this one belongs and put it there
+        // println!("Got universe {:?}", packet);
+    }
+}
+
+struct Stats {
+    total_packets: u64,
+    total_bytes: usize,
+    packets_since_last_report: u64,
+    bytes_since_last_report: usize,
+    last_report_time: Instant,
+}
+
 fn main() {
     let config = read_config_file("config.json").unwrap();
-    let outputs = Outputs::new(&config.mappings);
+    let mut outputs = Outputs::new(&config.mappings);
     let mut stats = Stats::new();
 
     {
@@ -156,7 +186,7 @@ fn main() {
 
             match command {
                 ArtCommand::Output(output) => {
-                    // println!("Handling output {:?}", output);
+                    outputs.add_universe(output);
                 }
 
                 // TODO: invent reasonable values to poll reply

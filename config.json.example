@@ -16,10 +16,8 @@
             16,
             31
           ],
-          "output": [
-            0,
-            15
-          ]
+          "//": "This is the first universe in destination, where data is sent
+          "output": 0
         }
       ]
     }
