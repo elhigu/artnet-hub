@@ -241,7 +241,9 @@ fn main() {
 
             match command {
                 ArtCommand::Output(output) => {
-                    outputs.add_universe(output);
+                    // outputs.add_universe(output);
+                    let bytes = ArtCommand::Output(output).write_to_buffer().unwrap();
+                    socket.send_to(&bytes, &outputs.devices[0].address).unwrap();
                 }
 
                 // TODO: invent reasonable values to poll reply
