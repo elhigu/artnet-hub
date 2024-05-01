@@ -26,7 +26,7 @@ packet. TODO: add benchmark info, how many universes it can deliver per second
             {
             "host": { "address": "192.168.0.11", "port": 6454 },
             "//": "Mapping which universes will be realayed here and what how they are mapped",
-            "universes": [{ "input": [16, 31], "output": [0, 15] }]
+            "universes": [{ "input": [16, 31], "output_start": 0 }]
             }
         ]
     }

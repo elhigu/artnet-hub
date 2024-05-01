@@ -5,6 +5,7 @@ use std::{fs::File, net::SocketAddr};
 use artnet_protocol::*;
 use std::net::{ToSocketAddrs, UdpSocket};
 
+use std::cmp;
 use std::thread;
 use std::time::Instant;
 
@@ -17,7 +18,7 @@ struct AddressConfig {
 #[derive(Serialize, Deserialize, Debug)]
 struct UniverseMappingConfig {
     input: (u16, u16),
-    output: u16,
+    output_start: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,50 +42,17 @@ fn read_config_file(file_path: &str) -> std::result::Result<Config, std::io::Err
     Ok(config)
 }
 
-impl Stats {
-    fn new() -> Stats {
-        Stats {
-            total_packets: 0,
-            total_bytes: 0,
-            packets_since_last_report: 0,
-            bytes_since_last_report: 0,
-            last_report_time: Instant::now(),
-        }
-    }
-
-    fn got_packet(&mut self, size: &usize) {
-        self.total_packets += 1;
-        self.total_bytes += size;
-        self.packets_since_last_report += 1;
-        self.bytes_since_last_report += size;
-
-        // report every 5 secs as a side effect :likeaboss:
-        if (self.last_report_time.elapsed().as_secs() > 5) {
-            self.report();
-        }
-    }
-
-    fn report(&mut self) {
-        let elapsed = self.last_report_time.elapsed();
-        println!(
-            "{} universes/s {:.2} Mbps",
-            (&self.packets_since_last_report * 1000000) as u128 / elapsed.as_micros(),
-            (&self.bytes_since_last_report * 1000000) as f64
-                / (elapsed.as_micros() as f64)
-                / 1024.
-                / 1024.
-                * 8.,
-        );
-        self.packets_since_last_report = 0;
-        self.bytes_since_last_report = 0;
-        self.last_report_time = Instant::now();
-    }
-}
-
 struct OutputDevice {
-    output_address: SocketAddr,
-    output_frame: Vec<u8>, // virtual screen where proxy writes the universes for passing them as a single frame to ESP
-    current_universes: Vec<u32>, // universes, which has arrived during this frame
+    address: SocketAddr,
+
+    // virtual screen where proxy writes the universes for passing them as a single frame to ESP
+    // or depending on protocol may as well send them as multiple universes with fixed packet
+    // headers and sync messages etc.
+    frame: Vec<u8>,
+
+    // universes, which has arrived during this frame
+    current_universes: Vec<u32>,
+
     // Helps figuring out if some packet has gone missing. Typically with gigabit network 100kB of data should arrive in less than 1ms.
     average_micros_to_get_all_universes: f32,
 }
@@ -92,12 +60,13 @@ struct OutputDevice {
 impl OutputDevice {
     fn new(config: &DeviceMappingConfig) -> OutputDevice {
         OutputDevice {
-            output_address: format!("{}:{}", &config.host.address, &config.host.port)
+            address: format!("{}:{}", &config.host.address, &config.host.port)
                 .to_socket_addrs()
                 .unwrap()
                 .next()
                 .unwrap(),
-            output_frame: Vec::new(), // TODO: figure out here from number of universes how big array is needed
+            // TODO: figure out here from number of universes how big array is needed
+            frame: Vec::new(),
             current_universes: Vec::new(),
             average_micros_to_get_all_universes: 0.,
         }
@@ -155,7 +124,93 @@ struct Stats {
     total_bytes: usize,
     packets_since_last_report: u64,
     bytes_since_last_report: usize,
+    time_since_last_call: Instant,
+    bucket_10: u64,
+    bucket_100: u64,
+    bucket_1000: u64,
+    bucket_5000: u64,
+    bucket_10000: u64,
+    bucket_15000: u64,
+    bucket_rest: u64,
     last_report_time: Instant,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats {
+            total_packets: 0,
+            total_bytes: 0,
+            packets_since_last_report: 0,
+            bytes_since_last_report: 0,
+            time_since_last_call: Instant::now(),
+            bucket_10: 0,
+            bucket_100: 0,
+            bucket_1000: 0,
+            bucket_5000: 0,
+            bucket_10000: 0,
+            bucket_15000: 0,
+            bucket_rest: 0,
+            last_report_time: Instant::now(),
+        }
+    }
+
+    fn got_packet(&mut self, size: &usize) {
+        self.total_packets += 1;
+        self.total_bytes += size;
+        self.packets_since_last_report += 1;
+        self.bytes_since_last_report += size;
+
+        let elapsed_usec = self.time_since_last_call.elapsed().as_micros();
+
+        match elapsed_usec {
+            0..=10 => self.bucket_10 += 1,
+            11..=100 => self.bucket_100 += 1,
+            101..=1000 => self.bucket_1000 += 1,
+            1001..=5000 => self.bucket_5000 += 1,
+            5001..=10000 => self.bucket_10000 += 1,
+            10001..=15000 => self.bucket_15000 += 1,
+            _ => self.bucket_rest += 1,
+        }
+
+        self.time_since_last_call = Instant::now();
+
+        // report every 5 secs as a side effect :likeaboss:
+        if self.last_report_time.elapsed().as_secs() > 5 {
+            self.report();
+        }
+    }
+
+    fn report(&mut self) {
+        let elapsed = self.last_report_time.elapsed();
+        println!(
+        "{} universes/s {:.2} Mbps Packet timings\n      0..10 usec: {} packets\n    11..100 usec: {} packets\n   101-1000 usec: {} packets\n  1001-5000 usec: {} packets\n 5001-10000 usec: {} packets\n10001-15000 usec: {} packets\n           rest : {} packets",
+        (&self.packets_since_last_report * 1000000) as u128 / elapsed.as_micros(),
+        (&self.bytes_since_last_report * 1000000) as f64
+            / (elapsed.as_micros() as f64)
+            / 1024.
+            / 1024.
+            * 8.,
+            self.bucket_10,
+            self.bucket_100,
+            self.bucket_1000,
+            self.bucket_5000,
+            self.bucket_10000,
+            self.bucket_15000,
+            self.bucket_rest
+            );
+
+        self.packets_since_last_report = 0;
+        self.bytes_since_last_report = 0;
+        self.last_report_time = Instant::now();
+
+        self.bucket_10 = 0;
+        self.bucket_100 = 0;
+        self.bucket_1000 = 0;
+        self.bucket_5000 = 0;
+        self.bucket_10000 = 0;
+        self.bucket_15000 = 0;
+        self.bucket_rest = 0;
+    }
 }
 
 fn main() {

@@ -16,8 +16,8 @@
             16,
             31
           ],
-          "//": "This is the first universe in destination, where data is sent
-          "output": 0
+          "//": "This is the universe which from first universe in destination, where data is sent",
+          "output_start": 0
         }
       ]
     }
