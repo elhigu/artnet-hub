@@ -10,16 +10,12 @@
         "port": 6454
       },
       "//": "Mapping which universes will be relayed here and what how they are mapped",
-      "universes": [
-        {
-          "input": [
-            16,
-            31
-          ],
-          "//": "This is the universe which from first universe in destination, where data is sent",
-          "output_start": 0
-        }
-      ]
+      "universes": {
+        "//": "[first, last] inclusive
+        "input": [16, 31],
+        "//": "This is the universe which from first universe in destination, where data is sent",
+        "output_start": 0
+      }
     }
   ]
 }

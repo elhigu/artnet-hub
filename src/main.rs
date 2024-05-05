@@ -1,13 +1,21 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::BorrowMut;
 use std::io::Read;
+use std::ops::Deref;
+use std::str::FromStr;
 use std::{fs::File, net::SocketAddr};
 
 use artnet_protocol::*;
 use std::net::{ToSocketAddrs, UdpSocket};
 
 use std::cmp;
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::sync::mpsc;
 use std::time::Instant;
+use std::time::Duration;
+
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AddressConfig {
@@ -24,7 +32,7 @@ struct UniverseMappingConfig {
 #[derive(Serialize, Deserialize, Debug)]
 struct DeviceMappingConfig {
     host: AddressConfig,
-    universes: Vec<UniverseMappingConfig>,
+    universes: UniverseMappingConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -43,79 +51,201 @@ fn read_config_file(file_path: &str) -> std::result::Result<Config, std::io::Err
 }
 
 struct OutputDevice {
-    address: SocketAddr,
+    address: String,
 
     // virtual screen where proxy writes the universes for passing them as a single frame to ESP
     // or depending on protocol may as well send them as multiple universes with fixed packet
     // headers and sync messages etc.
     frame: Vec<u8>,
 
-    // universes, which has arrived during this frame
-    current_universes: Vec<u32>,
+    // Universes, which has arrived during this frame
+    current_universes: HashSet<u16>,
 
     // Helps figuring out if some packet has gone missing. Typically with gigabit network 100kB of data should arrive in less than 1ms.
     average_micros_to_get_all_universes: f32,
+
+    // Current sequence
+    sequence: u8,
+
+    // Number of universes configured to send to this device
+    universe_count: u16,
+
+    // Universe offset to fix when writing then to virtual screen 
+    universe_offset: u16,
+
+    // Packets to send to client... this should be accessed only by sender thread
+    send_queue: Vec<Output>,
+
+    // thread communication and the join_handle of spawned thread, filled after thread is started
+    thread_tx: Option<mpsc::Sender<Output>>,
+    join_handle: Option<JoinHandle<()>>
+
+    // TODO: stats about how often actually full universe range was received
 }
 
 impl OutputDevice {
     fn new(config: &DeviceMappingConfig) -> OutputDevice {
+        let universe_count = config.universes.input.1 - config.universes.input.0 + 1;
+        let frame = vec![0;(universe_count as usize) * 510];
+
         OutputDevice {
-            address: format!("{}:{}", &config.host.address, &config.host.port)
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap(),
-            // TODO: figure out here from number of universes how big array is needed
-            frame: Vec::new(),
-            current_universes: Vec::new(),
+            address: format!("{}:{}", &config.host.address, &config.host.port),
+            frame,
+            current_universes: HashSet::new(),
             average_micros_to_get_all_universes: 0.,
+            sequence: 0,
+            universe_count,
+            universe_offset: config.universes.input.0,
+            send_queue: Vec::new(),
+            thread_tx: Option::None,
+            join_handle: Option::None
         }
     }
 
-    // TODO: maybe we need a little bit better data about universes that vec<u8>...
-    fn add_universe(&mut self) {
-        // TODO: get port address
-
-        // update destination universe
-
-        // add to incoming_universes to correct position (combine data and set RGB oder)
-
-        // if all universes of frame are in, send data to ESP
-        // and record how long it took to get all universes
-
-        // if some universe does not arrive in proper time then frame is sent without it and
-
-        // NOTE: if some universe is coming with unexpectedly long delay or a
-        //       universe does not come at all clear the incoming buffer and
-        //       return failure
+    fn next_sequence(&mut self) -> u8 {
+        if self.sequence == 255 {
+            self.sequence = 1;
+        } else {
+            self.sequence += 1;
+        }
+        return self.sequence;
     }
 
-    // TODO: when this is called? Probably when all universes of a frame has been received or
-    //       if too long has passed since the first packet of the frame
-    fn send_frame(&mut self) {}
+    // TODO: maybe we need a little bit better data about universes that vec<u8>...
+    fn add_universe(&mut self, mut packet: Output) {
+        // TODO: get mutex access to frame
+
+        // update destination universe
+        let mut data = packet.data.as_mut().to_vec();
+
+        // TODO: fix RGB, GRB order
+        if data.len() > 510 {
+            data.truncate(510);
+        }
+
+        let port: u16 = packet.port_address.into();
+        let start = (port-self.universe_offset) as usize * 510;
+        let end = start + data.len();
+        let range = start..end;
+        // println!("universe: {} to range: {:?}", port, range);
+        self.frame.splice(range, data);
+
+        // TODO: if the same universe is already in add duplicate universe error
+
+        self.current_universes.insert(port);
+
+        // println!("received universes {} expected amount {}", self.current_universes.len(), self.universe_count);
+
+        // if all universes has arrived, send them forward
+        if self.current_universes.len() == self.universe_count as usize {
+            self.current_universes.clear();
+            self.send_frame();
+        }
+
+        // TODO: if from first received universe has taken over 10ms send and add error to stats
+
+    }
+
+    fn send_frame(&mut self) {
+
+        // TODO: take mutex to lock thread accessing self.frame and self.send_queue
+        for universe in 0..self.universe_count {
+            let start:usize = universe as usize * 510;
+            let end = start + 510;
+            let data: Vec<u8> = self.frame[start..end].to_vec();
+            
+            let mut output = Output {
+                data: data.into(),
+                ..Output::default()
+            };
+            
+            // TODO: add output offset
+            output.port_address = PortAddress::try_from(universe).unwrap();
+            output.sequence = self.next_sequence();
+
+            self.thread_tx.as_mut().unwrap().send(output).unwrap();
+        }
+    }
+
+    fn start_output_thread(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.thread_tx = Some(tx);
+        let address = self.address.to_owned();
+
+        let join_handle = thread::spawn(move || {
+            let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+            loop {
+                for output in &rx {
+                    // TODO: if output is Option::None break loop
+                    let bytes = ArtCommand::Output(output).write_to_buffer().unwrap();
+                    socket.send_to(&bytes, &address).unwrap();
+                    // TODO: need to add better stats and testing how good this value is...
+                    //       now most important point is to check if ESP32 is still freezing randomly
+                    //       also check if there are dropped packets
+
+                    // TODO: add stats about out going packets
+                    thread::sleep(Duration::from_micros(300));
+                }
+                // TODO: add sync message?
+            }
+        });
+
+        self.join_handle = Some(join_handle);
+    }
+
+    fn stop(&mut self) -> std::result::Result<(), String> {
+        if let Some(handle) = self.join_handle.take() {
+            // TODO: send stop message to exit thread loop... make value to be Option<Output>
+            handle.join().map_err(|_| "Failed to join thread".to_string())
+        } else {
+            Ok(()) // Or handle this case differently if needed
+        }
+    }
+
 }
 
 struct Outputs {
     devices: Vec<OutputDevice>,
+    device_idx_by_universe: HashMap<u16, usize>
 }
 
 impl Outputs {
     fn new(config: &Vec<DeviceMappingConfig>) -> Outputs {
         let mut devices: Vec<OutputDevice> = Vec::new();
 
-        for device_config in config {
-            devices.push(OutputDevice::new(&device_config));
-        }
+        let mut device_by_port = HashMap::new();
 
-        Outputs { devices }
+        for device_config in config {
+            // add mapping to setup ports which universes should be delivered to this device
+            let input_range = device_config.universes.input.0..=device_config.universes.input.1;
+            for port in input_range {
+                // TODO: learn how to deal with multiple references to a same data and how to
+                //       bind lifespan properly 
+                device_by_port.insert(port, devices.len());
+            }
+
+            let mut device = OutputDevice::new(&device_config);
+            device.start_output_thread();
+            devices.push(device);
+        }
+        Outputs { devices, device_idx_by_universe: device_by_port }
     }
 
     fn add_universe(&mut self, packet: Output) {
-        // packet.port_address, length, data
-        // TODO: find device for the port_address, pass packet ownership there
+        let port: u16 = packet.port_address.into();
+        let device_idx = self.device_idx_by_universe.get(&port).unwrap_or(&usize::MAX);
+        
+        if *device_idx != usize::MAX {
+            self.devices[*device_idx].add_universe(packet);
+        } else {
+            println!("Got unmapped universe {}", port);
+        }
+    }
 
-        // TODO: figure out to which device this one belongs and put it there
-        // println!("Got universe {:?}", packet);
+    fn close(&mut self) {
+        for device in &mut self.devices {
+            device.stop().unwrap();
+        }
     }
 }
 
@@ -154,7 +284,7 @@ impl Stats {
         }
     }
 
-    fn got_packet(&mut self, size: &usize) {
+    fn log_packet(&mut self, size: &usize) {
         self.total_packets += 1;
         self.total_bytes += size;
         self.packets_since_last_report += 1;
@@ -237,13 +367,11 @@ fn main() {
             let (length, addr) = socket.recv_from(&mut buffer).unwrap();
             let command = ArtCommand::from_buffer(&buffer[..length]).unwrap();
 
-            stats.got_packet(&length);
+            stats.log_packet(&length);
 
             match command {
                 ArtCommand::Output(output) => {
-                    // outputs.add_universe(output);
-                    let bytes = ArtCommand::Output(output).write_to_buffer().unwrap();
-                    socket.send_to(&bytes, &outputs.devices[0].address).unwrap();
+                    outputs.add_universe(output);
                 }
 
                 // TODO: invent reasonable values to poll reply
@@ -320,4 +448,6 @@ fn main() {
             }
         }
     } // the socket is closed here
+
+    outputs.close();
 }
